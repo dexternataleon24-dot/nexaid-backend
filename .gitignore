@@ -4,3 +4,4 @@ cloudflared
 .env
 .DS_Store
 *.log
+node-env/
