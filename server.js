@@ -492,29 +492,37 @@ async function fetchYouTubeTranscriptRobust(videoId) {
 
 app.post('/api/test-raw', async (req, res) => {
   const { videoId } = req.body;
-  try {
-    const ytRes = await fetch("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": "com.google.android.youtube/20.10.38 (Linux; U; Android 14)"
-      },
-      body: JSON.stringify({
-        context: { client: { clientName: "ANDROID", clientVersion: "20.10.38" } },
-        videoId: videoId
-      })
-    });
-    const data = await ytRes.json();
-    res.json({
-      status: ytRes.status,
-      playabilityStatus: data.playabilityStatus,
-      captions: data?.captions,
-      hasCaptions: !!data.captions,
-      tracks: data?.captions?.playerCaptionsTracklistRenderer?.captionTracks
-    });
-  } catch(e) {
-    res.status(500).json({ error: e.message });
+  const clients = [
+    { name: "ANDROID", version: "20.10.38", ua: "com.google.android.youtube/20.10.38 (Linux; U; Android 14)" },
+    { name: "WEB_EMBEDDED_PLAYER", version: "1.20240313.01.00", ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" },
+    { name: "TVHTML5_SIMPLY_EMBEDDED_PLAYER", version: "2.0", ua: "Mozilla/5.0 (PlayStation; PlayStation 4/11.50) AppleWebKit/605.1.15 (KHTML, like Gecko)" },
+    { name: "IOS", version: "19.29.1", ua: "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X)" },
+    { name: "MWEB", version: "2.20240313.01.00", ua: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1" }
+  ];
+
+  const results = {};
+  for (const c of clients) {
+    try {
+      const ytRes = await fetch("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "User-Agent": c.ua },
+        body: JSON.stringify({
+          context: { client: { clientName: c.name, clientVersion: c.version } },
+          videoId: videoId
+        })
+      });
+      const data = await ytRes.json();
+      results[c.name] = {
+        playability: data.playabilityStatus?.status,
+        reason: data.playabilityStatus?.reason,
+        hasCaptions: !!data.captions,
+        captionTracksCount: data?.captions?.playerCaptionsTracklistRenderer?.captionTracks?.length || 0
+      };
+    } catch(e) {
+      results[c.name] = { error: e.message };
+    }
   }
+  res.json({ videoId, results });
 });
 
 app.post('/api/youtube/transcript', async (req, res) => {
