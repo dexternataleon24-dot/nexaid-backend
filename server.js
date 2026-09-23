@@ -368,6 +368,128 @@ function getYoutubeMetadata(videoId) {
   });
 }
 
+// Multi-strategy robust transcript retrieval
+async function fetchYouTubeTranscriptRobust(videoId) {
+  // Strategy 1: YouTube InnerTube Android Player API
+  try {
+    const res = await fetch("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "com.google.android.youtube/20.10.38 (Linux; U; Android 14)"
+      },
+      body: JSON.stringify({
+        context: {
+          client: {
+            clientName: "ANDROID",
+            clientVersion: "20.10.38"
+          }
+        },
+        videoId: videoId
+      })
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      const captionTracks = data?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+      const details = data?.videoDetails || {};
+
+      if (Array.isArray(captionTracks) && captionTracks.length > 0) {
+        // Preferred language order: en, id, or first available
+        const track = captionTracks.find(t => t.languageCode === "en") ||
+                      captionTracks.find(t => t.languageCode?.startsWith("en")) ||
+                      captionTracks.find(t => t.languageCode === "id") ||
+                      captionTracks[0];
+
+        // Format A: JSON3 timedtext
+        const jsonUrl = track.baseUrl.includes("fmt=")
+          ? track.baseUrl.replace(/fmt=[^&]+/, "fmt=json3")
+          : (track.baseUrl + "&fmt=json3");
+
+        try {
+          const jsonRes = await fetch(jsonUrl, {
+            headers: { "User-Agent": "com.google.android.youtube/20.10.38 (Linux; U; Android 14)" }
+          });
+          if (jsonRes.ok) {
+            const jsonCaption = await jsonRes.json();
+            if (jsonCaption.events && Array.isArray(jsonCaption.events)) {
+              const list = [];
+              for (const ev of jsonCaption.events) {
+                if (!ev.segs) continue;
+                const text = ev.segs.map(s => s.utf8 || "").join("").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
+                if (text) {
+                  list.push({
+                    text: text,
+                    duration: ev.dDurationMs || 0,
+                    offset: ev.tStartMs || 0,
+                    lang: track.languageCode
+                  });
+                }
+              }
+              if (list.length > 0) {
+                return {
+                  title: details.title,
+                  author: details.author,
+                  transcriptList: list
+                };
+              }
+            }
+          }
+        } catch (jsonErr) {
+          console.warn(`[YouTube Transcript] JSON3 retrieval failed for ${videoId}:`, jsonErr.message);
+        }
+
+        // Format B: XML timedtext fallback
+        try {
+          const xmlRes = await fetch(track.baseUrl);
+          if (xmlRes.ok) {
+            const xml = await xmlRes.text();
+            const list = [];
+            const pRegex = /<p\s+t="(\d+)"\s+d="(\d+)"[^>]*>([\s\S]*?)<\/p>/g;
+            let match;
+            while ((match = pRegex.exec(xml)) !== null) {
+              const raw = match[3].replace(/<[^>]+>/g, '').trim();
+              if (raw) {
+                list.push({
+                  text: raw.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'"),
+                  duration: parseInt(match[2], 10),
+                  offset: parseInt(match[1], 10),
+                  lang: track.languageCode
+                });
+              }
+            }
+            if (list.length > 0) {
+              return {
+                title: details.title,
+                author: details.author,
+                transcriptList: list
+              };
+            }
+          }
+        } catch (xmlErr) {
+          console.warn(`[YouTube Transcript] XML retrieval failed for ${videoId}:`, xmlErr.message);
+        }
+      }
+    }
+  } catch (innerTubeErr) {
+    console.warn(`[YouTube Transcript] InnerTube attempt failed for ${videoId}:`, innerTubeErr.message);
+  }
+
+  // Strategy 2: Fallback to YoutubeTranscript npm package
+  try {
+    const list = await YoutubeTranscript.fetchTranscript(videoId);
+    if (list && list.length > 0) {
+      return {
+        transcriptList: list
+      };
+    }
+  } catch (ytErr) {
+    console.warn(`[YouTube Transcript] YoutubeTranscript package fallback failed for ${videoId}:`, ytErr.message);
+  }
+
+  return null;
+}
+
 app.post('/api/youtube/transcript', async (req, res) => {
   const { videoUrl, videoId: clientVideoId } = req.body;
   
@@ -405,27 +527,17 @@ app.post('/api/youtube/transcript', async (req, res) => {
     console.log(`[YouTube Transcript] Retrieving transcript for: ${videoId}`);
     const metadata = await getYoutubeMetadata(videoId);
 
-    let transcriptList;
-    try {
-      transcriptList = await YoutubeTranscript.fetchTranscript(videoId);
-    } catch (err) {
-      console.warn(`[YouTube Transcript] fetchTranscript failed for ${videoId}:`, err.message);
+    const result = await fetchYouTubeTranscriptRobust(videoId);
+
+    if (!result || !result.transcriptList || result.transcriptList.length === 0) {
       return res.status(404).json({
         success: false,
         error: 'TRANSCRIPT_UNAVAILABLE',
-        message: 'Transcript unavailable for this YouTube video. Please upload the video\'s audio or video file instead.',
-        detail: err.message
+        message: 'Transcript unavailable for this YouTube video. Please upload the video\'s audio or video file instead.'
       });
     }
 
-    if (!transcriptList || transcriptList.length === 0) {
-      return res.status(404).json({
-        success: false,
-        error: 'TRANSCRIPT_UNAVAILABLE',
-        message: 'No usable transcript was found. Please upload the video\'s audio or video file instead.'
-      });
-    }
-
+    const transcriptList = result.transcriptList;
     const lastItem = transcriptList[transcriptList.length - 1];
     const durationMs = lastItem ? (lastItem.offset + lastItem.duration) : 0;
     const durationSec = Math.floor(durationMs / 1000);
@@ -452,8 +564,8 @@ app.post('/api/youtube/transcript', async (req, res) => {
     res.json({
       success: true,
       videoId: videoId,
-      title: metadata.title,
-      author: metadata.author,
+      title: result.title || metadata.title,
+      author: result.author || metadata.author,
       thumbnail: metadata.thumbnail,
       duration: durationSec,
       transcript: cleanTranscript,
@@ -471,7 +583,7 @@ app.post('/api/youtube/transcript', async (req, res) => {
 });
 
 // Start Server
-if (!process.env.VERCEL) {
+if (!process.env.VERCEL && require.main === module) {
   app.listen(PORT, () => {
     console.log(`============================================================`);
     console.log(` NexaCompress API Server running on port ${PORT}`);
