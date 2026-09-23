@@ -413,7 +413,8 @@ app.post('/api/youtube/transcript', async (req, res) => {
       return res.status(404).json({
         success: false,
         error: 'TRANSCRIPT_UNAVAILABLE',
-        message: 'Transcript unavailable for this YouTube video. Please upload the video\'s audio or video file instead.'
+        message: 'Transcript unavailable for this YouTube video. Please upload the video\'s audio or video file instead.',
+        detail: err.message
       });
     }
 
