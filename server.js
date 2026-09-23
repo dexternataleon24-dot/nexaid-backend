@@ -490,6 +490,33 @@ async function fetchYouTubeTranscriptRobust(videoId) {
   return null;
 }
 
+app.post('/api/test-raw', async (req, res) => {
+  const { videoId } = req.body;
+  try {
+    const ytRes = await fetch("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "com.google.android.youtube/20.10.38 (Linux; U; Android 14)"
+      },
+      body: JSON.stringify({
+        context: { client: { clientName: "ANDROID", clientVersion: "20.10.38" } },
+        videoId: videoId
+      })
+    });
+    const data = await ytRes.json();
+    res.json({
+      status: ytRes.status,
+      playabilityStatus: data.playabilityStatus,
+      captions: data?.captions,
+      hasCaptions: !!data.captions,
+      tracks: data?.captions?.playerCaptionsTracklistRenderer?.captionTracks
+    });
+  } catch(e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.post('/api/youtube/transcript', async (req, res) => {
   const { videoUrl, videoId: clientVideoId } = req.body;
   
