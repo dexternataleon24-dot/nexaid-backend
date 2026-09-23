@@ -464,9 +464,13 @@ app.post('/api/youtube/transcript', async (req, res) => {
 });
 
 // Start Server
-app.listen(PORT, () => {
-  console.log(`============================================================`);
-  console.log(` NexaCompress API Server running on port ${PORT}`);
-  console.log(` Configured Ghostscript command: "${gsCmd}"`);
-  console.log(`============================================================`);
-});
+if (!process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`============================================================`);
+    console.log(` NexaCompress API Server running on port ${PORT}`);
+    console.log(` Configured Ghostscript command: "${gsCmd}"`);
+    console.log(`============================================================`);
+  });
+}
+
+module.exports = app;
