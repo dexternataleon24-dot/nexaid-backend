@@ -34,9 +34,15 @@ app.use(cors({
 app.use(express.json());
 
 // Setup file uploads
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir, { recursive: true });
+const uploadDir = (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME)
+  ? path.join('/tmp', 'uploads')
+  : path.join(__dirname, 'uploads');
+try {
+  if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true });
+  }
+} catch (err) {
+  console.warn('[Server] Could not initialize uploadDir:', err.message);
 }
 
 const storage = multer.diskStorage({
