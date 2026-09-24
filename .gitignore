@@ -5,3 +5,5 @@ cloudflared
 .DS_Store
 *.log
 node-env/
+.vercel
+.env*

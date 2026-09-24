@@ -370,8 +370,60 @@ function getYoutubeMetadata(videoId) {
 
 // Multi-strategy robust transcript retrieval
 async function fetchYouTubeTranscriptRobust(videoId) {
-  // Strategy 1: YouTube InnerTube Android Player API
+  const isServerless = !!(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+
+  // Strategy 1: Supadata API (works from any IP, including datacenter/Vercel)
+  // This is the PRIMARY strategy for production since YouTube blocks datacenter IPs
+  const supadataKey = process.env.SUPADATA_API_KEY;
+  if (supadataKey) {
+    try {
+      console.log(`[YouTube Transcript] Trying Supadata API for ${videoId}...`);
+      const supadataUrl = `https://api.supadata.ai/v1/youtube/transcript?videoId=${videoId}&lang=en`;
+      const supadataRes = await fetch(supadataUrl, {
+        headers: { 'x-api-key': supadataKey },
+        signal: AbortSignal.timeout(15000)
+      });
+
+      if (supadataRes.ok) {
+        const supadataData = await supadataRes.json();
+        if (supadataData.content) {
+          // Supadata returns either an array of {text, offset, duration, lang} or a string
+          let transcriptList;
+          if (Array.isArray(supadataData.content)) {
+            transcriptList = supadataData.content.map(item => ({
+              text: (item.text || '').replace(/\n/g, ' ').trim(),
+              offset: item.offset || 0,
+              duration: item.duration || 0,
+              lang: item.lang || supadataData.lang || 'en'
+            }));
+          } else {
+            // Plain text mode — create a single entry
+            transcriptList = [{
+              text: String(supadataData.content).replace(/\n/g, ' ').trim(),
+              offset: 0,
+              duration: 0,
+              lang: supadataData.lang || 'en'
+            }];
+          }
+
+          if (transcriptList.length > 0) {
+            console.log(`[YouTube Transcript] Supadata success for ${videoId}: ${transcriptList.length} segments`);
+            return { transcriptList };
+          }
+        }
+      } else {
+        const errBody = await supadataRes.text().catch(() => '');
+        console.warn(`[YouTube Transcript] Supadata returned ${supadataRes.status} for ${videoId}: ${errBody.substring(0, 200)}`);
+      }
+    } catch (supadataErr) {
+      console.warn(`[YouTube Transcript] Supadata API failed for ${videoId}:`, supadataErr.message);
+    }
+  }
+
+  // Strategy 2: YouTube InnerTube Android Player API
+  // Works reliably from residential IPs (local dev) but blocked on datacenter IPs (Vercel)
   try {
+    console.log(`[YouTube Transcript] Trying InnerTube ANDROID for ${videoId}...`);
     const res = await fetch("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", {
       method: "POST",
       headers: {
@@ -386,7 +438,8 @@ async function fetchYouTubeTranscriptRobust(videoId) {
           }
         },
         videoId: videoId
-      })
+      }),
+      signal: AbortSignal.timeout(10000)
     });
 
     if (res.ok) {
@@ -401,32 +454,47 @@ async function fetchYouTubeTranscriptRobust(videoId) {
                       captionTracks.find(t => t.languageCode === "id") ||
                       captionTracks[0];
 
-        // Format A: JSON3 timedtext
-        const jsonUrl = track.baseUrl.includes("fmt=")
-          ? track.baseUrl.replace(/fmt=[^&]+/, "fmt=json3")
-          : (track.baseUrl + "&fmt=json3");
-
+        // Fetch caption XML (default format from InnerTube, most reliable)
         try {
-          const jsonRes = await fetch(jsonUrl, {
-            headers: { "User-Agent": "com.google.android.youtube/20.10.38 (Linux; U; Android 14)" }
+          const xmlRes = await fetch(track.baseUrl, {
+            headers: { "User-Agent": "com.google.android.youtube/20.10.38 (Linux; U; Android 14)" },
+            signal: AbortSignal.timeout(8000)
           });
-          if (jsonRes.ok) {
-            const jsonCaption = await jsonRes.json();
-            if (jsonCaption.events && Array.isArray(jsonCaption.events)) {
+          if (xmlRes.ok) {
+            const xml = await xmlRes.text();
+            if (xml.length > 0) {
               const list = [];
-              for (const ev of jsonCaption.events) {
-                if (!ev.segs) continue;
-                const text = ev.segs.map(s => s.utf8 || "").join("").replace(/\n/g, " ").replace(/\s+/g, " ").trim();
-                if (text) {
+              // Parse <p t="..." d="...">content</p> format
+              const pRegex = /<p\s+t="(\d+)"\s+d="(\d+)"[^>]*>([\s\S]*?)<\/p>/g;
+              let match;
+              while ((match = pRegex.exec(xml)) !== null) {
+                const raw = match[3].replace(/<[^>]+>/g, '').trim();
+                if (raw) {
                   list.push({
-                    text: text,
-                    duration: ev.dDurationMs || 0,
-                    offset: ev.tStartMs || 0,
+                    text: raw.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'"),
+                    duration: parseInt(match[2], 10),
+                    offset: parseInt(match[1], 10),
                     lang: track.languageCode
                   });
                 }
               }
+              // Also try <text start="..." dur="...">content</text> format
+              if (list.length === 0) {
+                const textRegex = /<text\s+start="([\d.]+)"\s+dur="([\d.]+)"[^>]*>([\s\S]*?)<\/text>/g;
+                while ((match = textRegex.exec(xml)) !== null) {
+                  const raw = match[3].replace(/<[^>]+>/g, '').trim();
+                  if (raw) {
+                    list.push({
+                      text: raw.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'"),
+                      duration: Math.floor(parseFloat(match[2]) * 1000),
+                      offset: Math.floor(parseFloat(match[1]) * 1000),
+                      lang: track.languageCode
+                    });
+                  }
+                }
+              }
               if (list.length > 0) {
+                console.log(`[YouTube Transcript] InnerTube XML success for ${videoId}: ${list.length} segments`);
                 return {
                   title: details.title,
                   author: details.author,
@@ -435,39 +503,8 @@ async function fetchYouTubeTranscriptRobust(videoId) {
               }
             }
           }
-        } catch (jsonErr) {
-          console.warn(`[YouTube Transcript] JSON3 retrieval failed for ${videoId}:`, jsonErr.message);
-        }
-
-        // Format B: XML timedtext fallback
-        try {
-          const xmlRes = await fetch(track.baseUrl);
-          if (xmlRes.ok) {
-            const xml = await xmlRes.text();
-            const list = [];
-            const pRegex = /<p\s+t="(\d+)"\s+d="(\d+)"[^>]*>([\s\S]*?)<\/p>/g;
-            let match;
-            while ((match = pRegex.exec(xml)) !== null) {
-              const raw = match[3].replace(/<[^>]+>/g, '').trim();
-              if (raw) {
-                list.push({
-                  text: raw.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'"),
-                  duration: parseInt(match[2], 10),
-                  offset: parseInt(match[1], 10),
-                  lang: track.languageCode
-                });
-              }
-            }
-            if (list.length > 0) {
-              return {
-                title: details.title,
-                author: details.author,
-                transcriptList: list
-              };
-            }
-          }
         } catch (xmlErr) {
-          console.warn(`[YouTube Transcript] XML retrieval failed for ${videoId}:`, xmlErr.message);
+          console.warn(`[YouTube Transcript] InnerTube XML retrieval failed for ${videoId}:`, xmlErr.message);
         }
       }
     }
@@ -475,10 +512,12 @@ async function fetchYouTubeTranscriptRobust(videoId) {
     console.warn(`[YouTube Transcript] InnerTube attempt failed for ${videoId}:`, innerTubeErr.message);
   }
 
-  // Strategy 2: Fallback to YoutubeTranscript npm package
+  // Strategy 3: Fallback to YoutubeTranscript npm package
   try {
+    console.log(`[YouTube Transcript] Trying YoutubeTranscript package for ${videoId}...`);
     const list = await YoutubeTranscript.fetchTranscript(videoId);
     if (list && list.length > 0) {
+      console.log(`[YouTube Transcript] Package success for ${videoId}: ${list.length} segments`);
       return {
         transcriptList: list
       };
